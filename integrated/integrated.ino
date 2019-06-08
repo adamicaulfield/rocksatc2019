@@ -4,8 +4,13 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_INA219.h>
+#include <avr/interrupt.h>
+#include "RadiationWatch.h"
 
-//Current measurement
+//Geiger Counter
+RadiationWatch radiationWatch;
+
+//INA219 Current 
 Adafruit_INA219 ina219;
 float current_mA = 0;
 
@@ -33,11 +38,14 @@ int v3_val = 0;
 String dataString = "";
 String dataCopy;
 const int chipSelect = BUILTIN_SDCARD;
+File dataFile;
+unsigned long csvStartTime;
 
 //INSS varaibles
 unsigned long chars;
 unsigned short sentences, failed;
 float flat, flon;
+int lat_high, lat_low, lon_high, lon_low;
 unsigned long age;
 int scale = 3; //scale of ADXL337
 float rawX; //teensy3.6 port 23
@@ -52,6 +60,7 @@ int baudrate = 4800; //4800 bps from https://www.parallax.com/sites/default/file
 IntervalTimer inssTimer;
 TinyGPS gps;
 SoftwareSerial ss(rx, tx);
+int fail_count = 0;
 
 //LED varaibles
 int ledState = LOW;
@@ -59,30 +68,79 @@ const int led = LED_BUILTIN;  // the pin with a LED
 
 // The setup() method runs once, when the sketch starts
 
+void csvKeys(Print &print=Serial)
+{
+  // inizialise start time
+  csvStartTime = millis();
+  // Write CSV keys to a print class (default print class is Serial).
+  print.println("time(ms),count,cpm,uSv/h,uSv/hError");
+}
+
+void csvStatus(RadiationWatch radiationWatch, Print &print=Serial)
+{
+  // Write CSV to a print class (default print class is Serial).
+  // time(ms)
+  print.print(millis() - csvStartTime);
+  print.print(',');
+  // count
+  print.print(radiationWatch.radiationCount());
+  print.print(',');
+  // cpm
+  print.print(radiationWatch.cpm(), 3);
+  print.print(',');
+  // uSv/h
+  print.print(radiationWatch.uSvh(), 3);
+  print.print(',');
+  // uSv/hError
+  print.print(radiationWatch.uSvhError(), 3);
+  print.print(',');
+  print.print(dataString);
+  print.println("");
+}
+
 void setup()   {
-  Serial.begin(9600); //9600 115200
+  Serial.begin(115200); //9600 115200
+  Serial.print("Initializing Card...");
   if (!SD.begin(chipSelect)) {
-    Serial.println("Card failed, or not present");
+    Serial.println("....Card failed, or not present");
     // don't do anything more:
-    return;
+    //return;
   }
   uint32_t currentFrequency;
   ina219.begin();
-  Serial.println("Initializing Card...");
+  Serial.println("Initialized successfully");
 
-  
   // initialize the digitals pin as an outputs
   pinMode(v1, OUTPUT);
   pinMode(v2, OUTPUT);
   pinMode(v3, OUTPUT);
   analogWriteResolution(8);
-  
+  pinMode(10, OUTPUT);
   pinMode(led, OUTPUT);
-  vstep_Timer.begin(voltage_step, 8000000-5); //1 second
+  vstep_Timer.begin(voltage_step, 8000000); //0.8 second
   ss.begin(baudrate);
   inssTimer.begin(inss_isr, 1000);  //1 ms
   vsweep_Timer.begin(voltage_sweep, 16000); //0.16 seconds
 
+  dataFile = SD.open("integrated.csv", FILE_WRITE);
+  if(!dataFile) {
+    Serial.println("Failed to open file");
+    return;
+  }
+  radiationWatch.setup();
+  // Print the CSV keys and the initial values.
+  csvKeys(dataFile);
+  csvStatus(radiationWatch, dataFile);
+  dataFile.flush();
+  // Register the callback.
+  radiationWatch.registerRadiationCallback(&onRadiationPulse);
+}
+
+
+void onRadiationPulse() {
+  // For each radiation write the current values to the SD card in CSV.
+  csvStatus(radiationWatch, dataFile);
+  dataFile.flush();
 }
 
 void voltage_sweep(void){
@@ -148,6 +206,11 @@ void inss_isr(void){
     }
     count++;
 
+    lat_high = (int) flat;
+    lat_low = abs((flat - (float)lat_high) *100000);
+
+    lon_high = (int) flon;
+    lon_low = abs((flon - (float)lon_high) *100000);
     
     dataString = "";
     dataString += String(current_mA);
@@ -168,9 +231,13 @@ void inss_isr(void){
     dataString += ","; 
     dataString += String(scaledZ);
     dataString += ","; 
-    dataString += String(flat);
+    dataString += String(lat_high);
     dataString += ","; 
-    dataString += String(flon);
+    dataString += String(lat_low);
+    dataString += ","; 
+    dataString += String(lon_high);
+    dataString += ","; 
+    dataString += String(lon_low);
     dataString += ","; 
     dataString += String(age);
     dataString += ","; 
@@ -180,21 +247,24 @@ void inss_isr(void){
     dataString += ","; 
     dataString += String(failed);
 
-    //Serial.println(dataString);
-
-    File dataFile = SD.open("integrated.txt", FILE_WRITE);
-    Serial.print("sizeof(dataString)=");
-    Serial.print(sizeof(dataString));
-    Serial.println("");
-    if (dataFile) {
-      Serial.println("HEllo");
-       dataFile.println(dataString);
-       dataFile.close();
-    }  
-     // if the file isn't open, pop up an error:
-    else {
-       //Serial.println("error opening file");
-    }
+    Serial.println(dataString);
+//    dataFile = SD.open("integrated_55.txt", FILE_WRITE);
+//    if (dataFile) {
+//      Serial.println("HEllo");
+//       dataFile.println(dataCopy);
+//       dataFile.flush();
+//       dataFile.close();
+//    }
+//     // if the file isn't open, pop up an error:
+//    else {
+//       if(fail_count == 0){
+//          Serial.println("error opening file");
+//          fail_count++;
+//       }
+//       return;
+//       
+//    }
+    
 }
 void voltage_step(void)
 {
@@ -221,5 +291,24 @@ void voltage_step(void)
 
 void loop()                     
 {
-  
+   radiationWatch.loop(); 
 }
+
+//    noInterrupts();
+//    dataCopy = dataString;
+//    interrupts();
+//    dataFile = SD.open("integrated_55.txt", FILE_WRITE);
+//    if (dataFile) {
+//      Serial.println("HEllo");
+//       dataFile.println(dataCopy);
+//       dataFile.close();
+//    }
+//     // if the file isn't open, pop up an error:
+//    else {
+//       if(fail_count == 0){
+//          Serial.println("error opening file");
+//          fail_count++;
+//       }
+//       return;
+//       
+//    }
